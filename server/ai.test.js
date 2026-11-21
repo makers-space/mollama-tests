@@ -5425,7 +5425,7 @@ describe('Linked devices', () => {
     const fakeApp = (deviceId, key, { holdPull = false, network = null, build = 'b12591' } = {}) => new Promise((resolve) => {
         const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
         const held = [];
-        const app = { ws, welcomed: false, requests: [], orders: [], probes: [], reach: { reachable: true }, closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
+        const app = { ws, welcomed: false, requests: [], orders: [], probes: [], runs: [], pooled: [], poolDown: false, reach: { reachable: true }, closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
         open.push(ws);
         const send = (message) => ws.send(JSON.stringify(message));
         ws.addEventListener('open', () => send({ type: 'hello', deviceId, key }));
@@ -5442,6 +5442,19 @@ describe('Linked devices', () => {
                 const lending = message.role === 'lend' && Boolean(message.bind) && (message.allow || []).length > 0;
                 return send({ type: 'pool-state', data: { build, role: message.role, setup: 'ready', progress: null, lending, address: lending ? message.bind : null, allow: lending ? message.allow : [], port: 50052, detail: null } });
             }
+            if (message.type === 'pool' && message.action === 'run') {
+                app.runs.push({ model: message.model, helpers: message.helpers, split: message.split, ctx: message.ctx });
+                send({ type: 'pool-state', data: { build, role: 'main', setup: 'ready', lending: false, address: null, allow: [], port: 50052, running: message.model, detail: null } });
+                return send({ id: message.id, type: 'answer', data: { ready: true } });
+            }
+            if (message.type === 'request' && message.via === 'pool') {
+                app.pooled.push({ path: message.path, body: JSON.parse(message.body || '{}') });
+                if (app.poolDown) return send({ id: message.id, type: 'error', code: 'POOL_DOWN' });
+                send({ id: message.id, type: 'head', status: 200, headers: { 'content-type': 'text/event-stream' } });
+                for (const piece of ['Pooled ', 'hello']) send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: piece } }] })}\n\n`).toString('base64') });
+                send({ id: message.id, type: 'chunk', data: Buffer.from(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 2 } })}\n\ndata: [DONE]\n\n`).toString('base64') });
+                return send({ id: message.id, type: 'end' });
+            }
             if (message.type === 'pool' && message.action === 'probe') {
                 app.probes.push(`${message.address}:${message.port}`);
                 return send({ id: message.id, type: 'answer', data: app.reach });
@@ -5451,7 +5464,8 @@ describe('Linked devices', () => {
             }
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
-            const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? TAGS : message.path === '/api/ps' ? { models: [] } : null;
+            const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? TAGS : message.path === '/api/ps' ? { models: [] }
+                : message.path === '/api/show' ? { capabilities: ['completion', 'tools'], model_info: { 'llama.context_length': 8192 }, details: {} } : null;
             if (!body) {
                 const notFound = () => {
                     send({ id: message.id, type: 'head', status: 404, headers: { 'content-type': 'application/json' } });
@@ -5620,6 +5634,63 @@ describe('Linked devices', () => {
         }
         expect(part.detail).toMatch(/pools a different way/);
         await client.put(`/api/v1/devices/${helper.id}/pool`, { role: 'off' });
+        await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'off' });
+    });
+
+    test('a ready pool is offered as a computer, starts the model on the main computer and answers through it', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Ethernet', wired: true }] });
+        const main = await link('run-main');
+        const lender = await link('run-lender');
+        const mainApp = await fakeApp(main.id, main.key, { network: home('10.9.4.10') });
+        await fakeApp(lender.id, lender.key, { network: home('10.9.4.20') });
+        const pickable = async () => (await client.get('/api/v1/devices?with=online')).data.devices.find((one) => one.kind === 'pool');
+        expect(await pickable()).toBeUndefined();
+
+        await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'main' });
+        await client.put(`/api/v1/devices/${lender.id}/pool`, { role: 'lend' });
+        let pool = null;
+        for (let tries = 0; tries < 80 && !pool; tries += 1) {
+            pool = await pickable();
+            if (!pool) await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(pool).toMatchObject({ name: 'Pool: run-main + run-lender', online: true, ollama: { available: true } });
+        expect(pool.hardware.memoryMb).toBe(65536);
+
+        // The pool's models are the main computer's.
+        const models = (await client.client.get('/api/v1/models', through(pool.id))).data.models.map((one) => one.name);
+        expect(models).toEqual(['tiny:1b']);
+
+        const made = await client.post('/api/v1/chats', { model: 'tiny:1b', device: pool.id });
+        const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Hello pool' }, { responseType: 'text', validateStatus: () => true });
+        const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toContain('Pooled hello');
+        expect(mainApp.runs).toEqual([{ model: 'tiny:1b', helpers: ['10.9.4.20:50052'], split: [28], ctx: 8192 }]);
+        expect(mainApp.pooled[0]).toMatchObject({ path: '/v1/chat/completions', body: { model: 'tiny:1b', stream: true } });
+        expect(JSON.stringify(mainApp.pooled[0].body.messages)).toContain('Hello pool');
+
+        // A second message uses the model already running: it is not started again.
+        await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Again' }, { responseType: 'text', validateStatus: () => true });
+        expect(mainApp.runs).toHaveLength(1);
+
+        // A computer that drops out ends the reply with a plain reason.
+        mainApp.poolDown = true;
+        const dropped = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Still there?' }, { responseType: 'text', validateStatus: () => true });
+        const failed = String(dropped.data).trim().split('\n').map((line) => JSON.parse(line)).find((event) => event.type === 'error');
+        expect(failed).toMatchObject({ code: 'POOL_STOPPED' });
+        expect(failed.message).toMatch(/stopped answering/);
+
+        // With no computer lending, the pool is not offered and a chat on it says why.
+        await client.put(`/api/v1/devices/${lender.id}/pool`, { role: 'off' });
+        expect(await pickable()).toBeUndefined();
+        const notReady = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Anyone?' }, { responseType: 'text', validateStatus: () => true });
+        expect(String(notReady.data)).toMatch(/POOL_NOT_READY|pool is not ready/);
+
+        // Another person cannot use this pool.
+        await testStartup.loginAsUser('user');
+        const theirs = await client.client.post('/api/v1/chats', { model: 'tiny:1b', device: pool.id }, { validateStatus: () => true });
+        expect(theirs.status).toBeGreaterThanOrEqual(400);
+        await testStartup.loginAsUser('admin');
         await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'off' });
     });
 
