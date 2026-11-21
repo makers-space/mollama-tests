@@ -5618,7 +5618,7 @@ describe('Linked devices', () => {
             part = pools.groups.find((group) => group.network === '10.9.2.0/24')?.computers.find((one) => one.id === helper.id);
             if (!part?.detail) await new Promise((resolve) => setTimeout(resolve, 50));
         }
-        expect(part.detail).toMatch(/b99999.*b12591/);
+        expect(part.detail).toMatch(/pools a different way/);
         await client.put(`/api/v1/devices/${helper.id}/pool`, { role: 'off' });
         await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'off' });
     });
