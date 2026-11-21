@@ -5460,7 +5460,7 @@ describe('Linked devices', () => {
                 return send({ id: message.id, type: 'answer', data: app.reach });
             }
             if (message.type === 'ask') {
-                return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768, ...(network ? { network } : {}) } });
+                return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768, ...((app.network || network) ? { network: app.network || network } : {}) } });
             }
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
@@ -5692,6 +5692,26 @@ describe('Linked devices', () => {
         expect(theirs.status).toBeGreaterThanOrEqual(400);
         await testStartup.loginAsUser('admin');
         await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'off' });
+    });
+
+    test('a network check on demand reads each computer again, so one that moved network is seen where it is now', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Wi-Fi', wired: false }] });
+        const one = await link('check-one');
+        const two = await link('check-two');
+        await fakeApp(one.id, one.key, { network: home('10.9.5.10') });
+        const twoApp = await fakeApp(two.id, two.key, { network: home('10.9.6.20') });
+        const sharing = (pools) => pools.groups.some((group) => group.computers.some((c) => c.id === one.id) && group.computers.some((c) => c.id === two.id));
+        let pools = (await client.get('/api/v1/devices/pools')).data;
+        for (let tries = 0; tries < 40 && pools.left.every((c) => c.id !== two.id); tries += 1) pools = (await client.get('/api/v1/devices/pools')).data;
+        expect(sharing(pools)).toBe(false);
+        // The second computer joins the first one's network; nothing is seen until it is read again.
+        twoApp.network = home('10.9.5.20');
+        expect(sharing((await client.get('/api/v1/devices/pools')).data)).toBe(false);
+        const checked = (await client.post('/api/v1/devices/pools/check', {})).data;
+        expect(checked.checkedAt).toBeTruthy();
+        expect(sharing(checked)).toBe(true);
+        expect(checked.groups.find((group) => group.network === '10.9.5.0/24').computers.map((c) => c.address).sort()).toEqual(['10.9.5.10', '10.9.5.20']);
     });
 
     test('a hello that cannot be checked just now asks the app to try again instead of forgetting its link', async () => {
