@@ -10,7 +10,7 @@ import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
-    fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
+    fitModel, fitPool, poolShareMb, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
@@ -890,6 +890,20 @@ describe('Fit rules', () => {
     const workstation = { memoryMb: 65536, gpuMemoryMb: 24576 };
     const noCard = { memoryMb: 16384, gpuMemoryMb: 0 };
 
+    test('a model too large for one computer fits several pooled when what they can give together is enough', () => {
+        // Each gives its graphics memory less the headroom, or with no graphics card its system memory less the reserve.
+        expect(poolShareMb(laptop)).toBe(8192 - 1536);
+        expect(poolShareMb(noCard)).toBe(16384 - 4096);
+        const big = { sizeMb: 15000, parameters: 24 };
+        expect(fitModel(big, noCard).fits).toBe(false);
+        expect(fitPool(big, [noCard, noCard])).toEqual({ fits: true, memoryMb: 12288 * 2, memoryNeededMb: memoryNeededMb(big) });
+        // A computer with a graphics card gives only its graphics memory to a pool.
+        expect(fitPool(big, [laptop, laptop]).fits).toBe(false);
+        // One computer is not a pool, and a model that only runs online is never pooled.
+        expect(fitPool(big, [workstation])).toBeNull();
+        expect(fitPool({ ...big, cloudOnly: true }, [laptop, noCard])).toBeNull();
+    });
+
     test('8 GB of graphics memory runs 7 to 9B models fully on the GPU', () => {
         for (const tag of ['mistral:7b', 'qwen2.5-coder:7b', 'llama3.1:8b']) {
             expect(fitModel(entry(tag), laptop).verdict).toBe('gpu');
@@ -1322,6 +1336,10 @@ describe('Model endpoints', () => {
             expect(kimi.fitting).toBe(0);
             expect((await get('/catalogue?q=coder%20qwen3')).data.models.map((model) => model.tag)).toEqual(['qwen3-coder:30b']);
             expect((await get('/catalogue?q=nothing-like-this')).data.models).toEqual([]);
+            // A model too large for the computer described says how many like it would hold it, pooled.
+            const tiny = (await get('/catalogue?q=gemma&memoryMb=8192&gpuMemoryMb=0')).data.models;
+            expect(tiny.find((model) => model.tag === 'gemma3:12b')).toMatchObject({ fit: { fits: false }, pool: { copies: 3 } });
+            expect(tiny.find((model) => model.tag === 'gemma3:4b')).toMatchObject({ fit: { fits: false }, pool: { copies: 2 } });
             expect((await get('/catalogue?page=0')).status).toBe(400);
             expect((await get('/catalogue?size=10')).status).toBe(400);
             const small = await get('/catalogue?size=12');
