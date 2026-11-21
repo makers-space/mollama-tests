@@ -5422,10 +5422,10 @@ describe('Linked devices', () => {
     const open = [];
 
     // Stands in for the desktop app: connects, says hello, and answers what the server asks of it.
-    const fakeApp = (deviceId, key, { holdPull = false, network = null } = {}) => new Promise((resolve) => {
+    const fakeApp = (deviceId, key, { holdPull = false, network = null, build = 'b12591' } = {}) => new Promise((resolve) => {
         const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
         const held = [];
-        const app = { ws, welcomed: false, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
+        const app = { ws, welcomed: false, requests: [], orders: [], probes: [], reach: { reachable: true }, closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
         open.push(ws);
         const send = (message) => ws.send(JSON.stringify(message));
         ws.addEventListener('open', () => send({ type: 'hello', deviceId, key }));
@@ -5435,6 +5435,16 @@ describe('Linked devices', () => {
             if (message.type === 'welcome') {
                 app.welcomed = true;
                 return resolve(app);
+            }
+            // Pooling as the desktop app does it: an order to lend with an address to admit opens the gate on 'bind'.
+            if (message.type === 'pool' && message.action === 'apply') {
+                app.orders.push({ role: message.role, bind: message.bind ?? null, allow: message.allow ?? [] });
+                const lending = message.role === 'lend' && Boolean(message.bind) && (message.allow || []).length > 0;
+                return send({ type: 'pool-state', data: { build, role: message.role, setup: 'ready', progress: null, lending, address: lending ? message.bind : null, allow: lending ? message.allow : [], port: 50052, detail: null } });
+            }
+            if (message.type === 'pool' && message.action === 'probe') {
+                app.probes.push(`${message.address}:${message.port}`);
+                return send({ id: message.id, type: 'answer', data: app.reach });
             }
             if (message.type === 'ask') {
                 return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768, ...(network ? { network } : {}) } });
@@ -5521,6 +5531,96 @@ describe('Linked devices', () => {
         const theirs = (await client.get('/api/v1/devices/pools')).data;
         expect(JSON.stringify(theirs)).not.toContain(pc.id);
         await testStartup.loginAsUser('admin');
+    });
+
+    test('a lending computer is told to admit only its main computer, and the main computer checks that it can reach it', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Ethernet', wired: true }] });
+        const until = async (check) => {
+            let last = null;
+            for (let tries = 0; tries < 80; tries += 1) {
+                last = (await client.get('/api/v1/devices/pools')).data;
+                if (check(last)) return last;
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            return last;
+        };
+        const ordered = async (app, want) => {
+            for (let tries = 0; tries < 60 && JSON.stringify(app.orders.at(-1)) !== JSON.stringify(want); tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+            return app.orders.at(-1);
+        };
+        const pc = await link('lend-pc');
+        const mac = await link('lend-mac');
+        const pcApp = await fakeApp(pc.id, pc.key, { network: home('10.9.1.10') });
+        const macApp = await fakeApp(mac.id, mac.key, { network: home('10.9.1.20') });
+        const groupOf = (pools) => pools.groups.find((group) => group.network === '10.9.1.0/24');
+        const partOf = (pools, id) => groupOf(pools)?.computers.find((one) => one.id === id);
+        await until((pools) => groupOf(pools)?.computers.length === 2);
+        // Computers that never pooled are told nothing.
+        expect([pcApp.orders, macApp.orders]).toEqual([[], []]);
+
+        // Lending with no main computer yet sets the computer up but keeps its gate shut.
+        expect((await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'lend' })).status).toBe(200);
+        expect(await ordered(macApp, { role: 'lend', bind: null, allow: [] })).toEqual({ role: 'lend', bind: null, allow: [] });
+
+        // Once there is a main computer on the same network, the lender admits that one address and nothing else.
+        const set = await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'main' });
+        expect(set.data.main).toBe(pc.id);
+        expect(await ordered(pcApp, { role: 'main', bind: null, allow: [] })).toEqual({ role: 'main', bind: null, allow: [] });
+        expect(await ordered(macApp, { role: 'lend', bind: '10.9.1.20', allow: ['10.9.1.10'] })).toEqual({ role: 'lend', bind: '10.9.1.20', allow: ['10.9.1.10'] });
+        let pools = await until((found) => partOf(found, mac.id)?.reachable === true);
+        expect(pcApp.probes).toContain('10.9.1.20:50052');
+        expect(partOf(pools, mac.id)).toMatchObject({ role: 'lend', setup: 'ready', lending: true, reachable: true, detail: null });
+        expect(partOf(pools, pc.id)).toMatchObject({ role: 'main', lending: false });
+
+        // A gate that turns the main computer away says so.
+        pcApp.reach = { reachable: false, detail: 'It turned this computer away.' };
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'lend' });
+        pools = await until((found) => partOf(found, mac.id)?.reachable === false);
+        expect(partOf(pools, mac.id).detail).toBe('It turned this computer away.');
+
+        // Another person cannot change these computers, and a part that does not exist is refused.
+        await testStartup.loginAsUser('user');
+        expect((await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' })).status).toBe(404);
+        await testStartup.loginAsUser('admin');
+        expect((await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'boss' })).status).toBe(400);
+
+        // A person has one main computer: choosing another sets the first one off, and lending stops.
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'main' });
+        expect(await ordered(pcApp, { role: 'off', bind: null, allow: [] })).toEqual({ role: 'off', bind: null, allow: [] });
+        pools = await until((found) => found.main === mac.id && partOf(found, pc.id)?.role === 'off');
+        expect(partOf(pools, mac.id)).toMatchObject({ role: 'main', lending: false });
+
+        // When the main computer goes offline, the lender shuts its gate.
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'lend' });
+        expect(await ordered(pcApp, { role: 'lend', bind: '10.9.1.10', allow: ['10.9.1.20'] })).toEqual({ role: 'lend', bind: '10.9.1.10', allow: ['10.9.1.20'] });
+        macApp.ws.close();
+        await macApp.closed;
+        for (let tries = 0; tries < 60 && pcApp.orders.at(-1).allow.length > 0; tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(await ordered(pcApp, { role: 'lend', bind: null, allow: [] })).toEqual({ role: 'lend', bind: null, allow: [] });
+        await client.put(`/api/v1/devices/${pc.id}/pool`, { role: 'off' });
+        await client.put(`/api/v1/devices/${mac.id}/pool`, { role: 'off' });
+    });
+
+    test('a lending computer on another llama.cpp build than the main computer is told why it cannot pool', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address) => ({ addresses: [{ address, prefix: 24, interface: 'Wi-Fi', wired: false }] });
+        const main = await link('build-main');
+        const helper = await link('build-helper');
+        await fakeApp(main.id, main.key, { network: home('10.9.2.10') });
+        await fakeApp(helper.id, helper.key, { network: home('10.9.2.20'), build: 'b99999' });
+        await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'main' });
+        await client.put(`/api/v1/devices/${helper.id}/pool`, { role: 'lend' });
+        let part = null;
+        for (let tries = 0; tries < 60 && !part?.detail; tries += 1) {
+            const pools = (await client.get('/api/v1/devices/pools')).data;
+            part = pools.groups.find((group) => group.network === '10.9.2.0/24')?.computers.find((one) => one.id === helper.id);
+            if (!part?.detail) await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(part.detail).toMatch(/b99999.*b12591/);
+        await client.put(`/api/v1/devices/${helper.id}/pool`, { role: 'off' });
+        await client.put(`/api/v1/devices/${main.id}/pool`, { role: 'off' });
     });
 
     test('a hello that cannot be checked just now asks the app to try again instead of forgetting its link', async () => {
